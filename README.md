@@ -76,9 +76,38 @@ If you want console output for debugging:
   - `hotkey_toggle = "f9"`
   - `hotkey_quit = "f10"`
 
-## 6. GPU notes
+## 6. Run on a PC without GPU (CPU mode)
 
-The script uses:
+If you do not have an NVIDIA GPU, update `Config` in `main.py`:
+
+```python
+device = "cpu"
+compute_type = "int8"
+model_size = "small"  # or "base" for weaker CPUs
+```
+
+Recommendations for CPU mode:
+- Start with `model_size = "small"` for a balance of speed/quality.
+- If transcription is still slow, switch to `model_size = "base"`.
+- `medium`/`large-v3` on CPU are usually much slower and may lag in real-time use.
+
+## 7. Encoding (important for Russian text)
+
+Use UTF-8 in terminal to avoid garbled Cyrillic output:
+
+```powershell
+chcp 65001
+$env:PYTHONUTF8 = "1"
+python main.py
+```
+
+Also ensure files are saved in UTF-8:
+- `main.py`
+- `README.md`
+
+## 8. GPU notes
+
+Default GPU config:
 
 ```python
 device = "cuda"
@@ -87,7 +116,7 @@ compute_type = "float16"
 
 If GPU is not used, verify your CUDA stack and `ctranslate2`/`faster-whisper` environment.
 
-## 7. Troubleshooting
+## 9. Troubleshooting
 
 ### Hotkeys do not work
 - Run terminal as Administrator.
@@ -109,18 +138,18 @@ If GPU is not used, verify your CUDA stack and `ctranslate2`/`faster-whisper` en
 - Increase `pause_sec`.
 - Lower `silence_rms_threshold` if silence detector is too aggressive.
 
-## 8. Privacy
+## 10. Privacy
 
 - Audio is processed locally on your machine.
 - No cloud transcription is used by this script itself.
 
-## 9. Limitations
+## 11. Limitations
 
 - This is optimized for Windows desktop usage.
 - Active-window typing may interfere with your own typing if both happen at once.
 - Accuracy depends heavily on microphone quality and room noise.
 
-## 10. Recommended repository structure
+## 12. Recommended repository structure
 
 - `main.py` - main script
 - `requirements.txt` - dependencies
