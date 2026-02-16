@@ -41,6 +41,12 @@ At startup, script is paused:
 - `F9` -> start/pause
 - `F10` -> quit
 
+Default transcription language on startup is Russian (`ru`).
+You can switch language by saying a single command word (the command itself is not typed to output):
+- switch to Russian (`ru`): `русский` / `russian` / `russisch`
+- switch to English (`en`): `английский` / `english` / `englisch`
+- switch to German (`de`): `немецкий` / `german` / `deutsch`
+
 ## 4. How output works
 
 - Default mode: `output_mode = "active_window"`
@@ -125,7 +131,7 @@ If GPU is not used, verify your CUDA stack and `ctranslate2`/`faster-whisper` en
 
 ### Text quality is poor / wrong phrases
 - Keep microphone close and clean input signal.
-- Keep `language = "ru"` for Russian-only speech.
+- For best accuracy, keep the active transcription language aligned with the spoken language (use voice commands above to switch).
 - Increase model size (`large-v3`) for better accuracy.
 - Tune chunking: larger `pause_sec` and `min_emit_sec` reduce fragmented chunks.
 

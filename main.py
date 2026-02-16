@@ -71,6 +71,9 @@ class Transcriber:
             device_index=cfg.cuda_device,
         )
 
+    def set_language(self, language: str) -> None:
+        self.cfg.language = language
+
     def transcribe(self, pcm_i16: np.ndarray) -> str:
         if pcm_i16.size == 0:
             return ""
@@ -157,6 +160,24 @@ def main() -> int:
     silence_chunks_needed = max(1, int(cfg.pause_sec * 1000 / cfg.block_ms))
 
     transcriber = Transcriber(cfg)
+    language_commands = {
+        "ru": {"русский", "russian", "russisch"},
+        "en": {"english", "английский", "englisch"},
+        "de": {"немецкий", "german", "deutsch"},
+    }
+    language_names = {"ru": "русский", "en": "английский", "de": "немецкий"}
+
+    def normalize_command(text: str) -> str:
+        return text.strip().lower().strip(".,!?;:()[]{}\"'")
+
+    def try_switch_language(text: str) -> bool:
+        normalized = normalize_command(text)
+        for language, commands in language_commands.items():
+            if normalized in commands:
+                transcriber.set_language(language)
+                print(f"\nЯзык транскрибации: {language_names[language]} ({language}).", flush=True)
+                return True
+        return False
 
     def enqueue_audio(payload: bytes) -> None:
         if not payload:
@@ -176,6 +197,8 @@ def main() -> int:
             pcm = np.frombuffer(item, dtype=np.int16)
             text = transcriber.transcribe(pcm)
             if text:
+                if try_switch_language(text):
+                    continue
                 if cfg.output_mode == "active_window":
                     keyboard.type(text + " ")
                     if cfg.add_newline:
