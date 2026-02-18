@@ -9,6 +9,8 @@ The script supports:
 - GPU inference (`CUDA`) when available,
 - pause/resume with global hotkeys,
 - automatic chunking by speech pauses,
+- automatic sentence dot insertion when a chunk is closed by a long pause,
+- auto-pause after inactivity (no successful transcription for a configured time),
 - async processing to reduce audio overflows.
 
 ## 1. Requirements
@@ -52,11 +54,19 @@ You can switch language by saying a single command word (the command itself is n
 - Default mode: `output_mode = "active_window"`
 - The script types text into the app that currently has keyboard focus.
 - By default, `add_newline = False`, so it does not press Enter automatically.
+- If a chunk is sent because the silence interval reached `pause_sec`, the script adds a trailing `.` to that chunk (if it does not already end with `.`, `!`, or `?`).
 
 If you want console output for debugging:
 - set `output_mode = "console"` in `main.py`.
 
-## 5. Main config (main.py)
+## 5. Recording state and auto-pause
+
+- Startup state is `PAUSE` (recording is off until `F9`).
+- While in `RECORD`, if there is no successful transcription for `inactivity_pause_sec` seconds, the script automatically returns to `PAUSE`.
+- Default `inactivity_pause_sec` value is `120` seconds (2 minutes).
+- To resume after auto-pause, press `F9`.
+
+## 6. Main config (main.py)
 
 `Config` contains all key settings:
 
@@ -65,6 +75,7 @@ If you want console output for debugging:
   - `block_ms` (audio callback block size)
 - Chunking:
   - `pause_sec` (silence duration to close chunk)
+  - `inactivity_pause_sec` (auto-pause timeout when no transcription is produced)
   - `min_utterance_sec` (minimum accepted utterance)
   - `min_emit_sec` (minimum chunk size before pause-based send)
   - `max_utterance_sec` (forced split for very long speech)
@@ -82,7 +93,7 @@ If you want console output for debugging:
   - `hotkey_toggle = "f9"`
   - `hotkey_quit = "f10"`
 
-## 6. Run on a PC without GPU (CPU mode)
+## 7. Run on a PC without GPU (CPU mode)
 
 If you do not have an NVIDIA GPU, update `Config` in `main.py`:
 
@@ -97,7 +108,7 @@ Recommendations for CPU mode:
 - If transcription is still slow, switch to `model_size = "base"`.
 - `medium`/`large-v3` on CPU are usually much slower and may lag in real-time use.
 
-## 7. Encoding (important for Russian text)
+## 8. Encoding (important for Russian text)
 
 Use UTF-8 in terminal to avoid garbled Cyrillic output:
 
@@ -111,7 +122,7 @@ Also ensure files are saved in UTF-8:
 - `main.py`
 - `README.md`
 
-## 8. GPU notes
+## 9. GPU notes
 
 Default GPU config:
 
@@ -122,7 +133,7 @@ compute_type = "float16"
 
 If GPU is not used, verify your CUDA stack and `ctranslate2`/`faster-whisper` environment.
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
 ### Hotkeys do not work
 - Run terminal as Administrator.
@@ -144,18 +155,18 @@ If GPU is not used, verify your CUDA stack and `ctranslate2`/`faster-whisper` en
 - Increase `pause_sec`.
 - Lower `silence_rms_threshold` if silence detector is too aggressive.
 
-## 10. Privacy
+## 11. Privacy
 
 - Audio is processed locally on your machine.
 - No cloud transcription is used by this script itself.
 
-## 11. Limitations
+## 12. Limitations
 
 - This is optimized for Windows desktop usage.
 - Active-window typing may interfere with your own typing if both happen at once.
 - Accuracy depends heavily on microphone quality and room noise.
 
-## 12. Recommended repository structure
+## 13. Recommended repository structure
 
 - `main.py` - main script
 - `requirements.txt` - dependencies

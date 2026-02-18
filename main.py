@@ -16,12 +16,13 @@ class Config:
     sample_rate: int = 16000
     block_ms: int = 100
     pause_sec: float = 1.4
+    inactivity_pause_sec: float = 120.0
     min_utterance_sec: float = 0.9
     min_emit_sec: float = 3.5
     max_utterance_sec: float = 20.0
     max_split_overlap_sec: float = 0.6
     silence_rms_threshold: float = 0.005
-    model_size: str = "medium"  # "tiny", "base", "small", "medium", "large", "large-v2", "large-v3"
+    model_size: str = "large-v3"  # "tiny", "base", "small", "medium", "large", "large-v2", "large-v3"
     device: str = "cuda"  # "cpu" or "cuda"
     compute_type: str = "float16"  # "int8", "int8_float16", "float16", "float32"
     cuda_device: int = 0
@@ -128,12 +129,13 @@ def main() -> int:
     running.clear()
     stop_requested = threading.Event()
     flush_requested = threading.Event()
+    last_transcription_time = time.monotonic()
 
     block_samples = int(cfg.sample_rate * cfg.block_ms / 1000)
     block_bytes = block_samples * 2  # int16
 
     q: queue.Queue[bytes] = queue.Queue(maxsize=200)
-    work_q: queue.Queue[bytes | None] = queue.Queue(maxsize=10)
+    work_q: queue.Queue[tuple[bytes, bool] | None] = queue.Queue(maxsize=10)
 
     def audio_callback(indata, _frames, _time, status):
         if status:
@@ -151,7 +153,11 @@ def main() -> int:
         callback=audio_callback,
     )
 
-    print("Состояние: ПАУЗА. Для запуска нажмите F9. Для выхода нажмите F10.", flush=True)
+    print(
+        f"Состояние: ПАУЗА. Для запуска нажмите F9. Для выхода нажмите F10. "
+        f"Автопауза: {int(cfg.inactivity_pause_sec)} сек без транскрибации.",
+        flush=True,
+    )
 
     min_utt_bytes = int(cfg.min_utterance_sec * cfg.sample_rate) * 2
     min_emit_bytes = int(cfg.min_emit_sec * cfg.sample_rate) * 2
@@ -179,24 +185,29 @@ def main() -> int:
                 return True
         return False
 
-    def enqueue_audio(payload: bytes) -> None:
+    def enqueue_audio(payload: bytes, add_sentence_dot: bool = False) -> None:
         if not payload:
             return
         while not stop_requested.is_set():
             try:
-                work_q.put(payload, timeout=0.2)
+                work_q.put((payload, add_sentence_dot), timeout=0.2)
                 return
             except queue.Full:
                 continue
 
     def worker():
+        nonlocal last_transcription_time
         while True:
             item = work_q.get()
             if item is None:
                 return
-            pcm = np.frombuffer(item, dtype=np.int16)
+            payload, add_sentence_dot = item
+            pcm = np.frombuffer(payload, dtype=np.int16)
             text = transcriber.transcribe(pcm)
             if text:
+                last_transcription_time = time.monotonic()
+                if add_sentence_dot and text[-1] not in ".!?":
+                    text = f"{text}."
                 if try_switch_language(text):
                     continue
                 if cfg.output_mode == "active_window":
@@ -213,13 +224,18 @@ def main() -> int:
     worker_thread.start()
 
     def on_toggle():
+        nonlocal last_transcription_time
         if running.is_set():
             running.clear()
             flush_requested.set()
             print("\nСостояние: ПАУЗА. Для запуска нажмите F9.", flush=True)
         else:
             running.set()
-            print("\nСостояние: ЗАПИСЬ.", flush=True)
+            last_transcription_time = time.monotonic()
+            print(
+                f"\nСостояние: ЗАПИСЬ. Автопауза через {int(cfg.inactivity_pause_sec)} сек без транскрибации.",
+                flush=True,
+            )
 
     def on_quit():
         stop_requested.set()
@@ -238,6 +254,15 @@ def main() -> int:
             capture_buffer = bytearray()
             silence_chunks = 0
             while not stop_requested.is_set():
+                if running.is_set() and (time.monotonic() - last_transcription_time >= cfg.inactivity_pause_sec):
+                    running.clear()
+                    capture_buffer.clear()
+                    silence_chunks = 0
+                    print(
+                        f"\nСостояние: ПАУЗА. Нет транскрибации {int(cfg.inactivity_pause_sec)} сек. Для запуска нажмите F9.",
+                        flush=True,
+                    )
+
                 if flush_requested.is_set():
                     if len(capture_buffer) >= min_utt_bytes:
                         enqueue_audio(bytes(capture_buffer))
@@ -274,7 +299,7 @@ def main() -> int:
                     and len(capture_buffer) >= min_emit_bytes
                     and silence_chunks >= silence_chunks_needed
                 ):
-                    enqueue_audio(bytes(capture_buffer))
+                    enqueue_audio(bytes(capture_buffer), add_sentence_dot=True)
                     capture_buffer.clear()
                     silence_chunks = 0
 
