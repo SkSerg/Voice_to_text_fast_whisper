@@ -1,4 +1,5 @@
 import queue
+import re
 import sys
 import threading
 import time
@@ -47,6 +48,8 @@ class Config:
     hotkey_quit: str = "f10"
     replace_ellipsis: bool = True
     strip_trailing_punctuation: bool = True
+    skip_if_buffer_rms_below: float = 0.0035
+    min_voiced_chunk_ratio: float = 0.12
     type_delay_sec: float = 0.01  # small delay between keypresses
     add_newline: bool = False
 
@@ -74,6 +77,12 @@ class Transcriber:
 
     def set_language(self, language: str) -> None:
         self.cfg.language = language
+
+    @staticmethod
+    def _normalize_text_for_filtering(text: str) -> str:
+        normalized = text.lower().replace("ё", "е")
+        normalized = re.sub(r"[^\w\s]", " ", normalized)
+        return " ".join(normalized.split())
 
     def transcribe(self, pcm_i16: np.ndarray) -> str:
         if pcm_i16.size == 0:
@@ -114,8 +123,17 @@ class Transcriber:
         text = "".join(selected_texts).strip()
         if self.cfg.replace_ellipsis:
             text = text.replace("…", " ").replace("...", " ")
-        for phrase in self.cfg.blacklist_phrases:
-            text = text.replace(phrase, "").strip()
+        normalized_text = self._normalize_text_for_filtering(text)
+        normalized_blacklist = {
+            self._normalize_text_for_filtering(phrase) for phrase in self.cfg.blacklist_phrases
+        }
+        for phrase in normalized_blacklist:
+            if phrase and phrase in normalized_text:
+                return ""
+        if "продолжение следует" in normalized_text:
+            return ""
+        if "субтитры" in normalized_text and "dimatorzok" in normalized_text:
+            return ""
         text = " ".join(text.split())
         if self.cfg.strip_trailing_punctuation:
             text = text.rstrip(".,!?;:")
@@ -203,6 +221,10 @@ def main() -> int:
                 return
             payload, add_sentence_dot = item
             pcm = np.frombuffer(payload, dtype=np.int16)
+            pcm_f32 = pcm.astype(np.float32) / 32768.0
+            buffer_rms = float(np.sqrt(np.mean(pcm_f32 * pcm_f32))) if pcm_f32.size else 0.0
+            if buffer_rms < cfg.skip_if_buffer_rms_below:
+                continue
             text = transcriber.transcribe(pcm)
             if text:
                 last_transcription_time = time.monotonic()
@@ -299,6 +321,13 @@ def main() -> int:
                     and len(capture_buffer) >= min_emit_bytes
                     and silence_chunks >= silence_chunks_needed
                 ):
+                    chunks_total = len(capture_buffer) // block_bytes
+                    voiced_chunks = max(0, chunks_total - silence_chunks)
+                    voiced_ratio = (voiced_chunks / chunks_total) if chunks_total > 0 else 0.0
+                    if voiced_ratio < cfg.min_voiced_chunk_ratio:
+                        capture_buffer.clear()
+                        silence_chunks = 0
+                        continue
                     enqueue_audio(bytes(capture_buffer), add_sentence_dot=True)
                     capture_buffer.clear()
                     silence_chunks = 0
