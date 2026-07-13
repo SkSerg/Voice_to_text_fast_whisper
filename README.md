@@ -7,10 +7,8 @@ Local speech-to-text script for Windows that:
 
 The script supports:
 - GPU inference (`CUDA`) when available,
-- pause/resume with global hotkeys,
-- automatic chunking by speech pauses,
-- automatic sentence dot insertion when a chunk is closed by a long pause,
-- auto-pause after inactivity (no successful transcription for a configured time),
+- push-to-talk recording with a global hotkey,
+- transcription of the complete recording after the hotkey is released,
 - async processing to reduce audio overflows.
 
 ## 1. Requirements
@@ -39,8 +37,9 @@ pip install -r requirements.txt
 python main.py
 ```
 
-At startup, script is paused:
-- `F9` -> start/pause
+At startup, the script waits for push-to-talk:
+- hold `F9` -> record audio
+- release `F9` -> stop recording, transcribe the complete recording, and type it
 - `F10` -> quit
 
 Default transcription language on startup is Russian (`ru`).
@@ -54,17 +53,17 @@ You can switch language by saying a single command word (the command itself is n
 - Default mode: `output_mode = "active_window"`
 - The script types text into the app that currently has keyboard focus.
 - By default, `add_newline = False`, so it does not press Enter automatically.
-- If a chunk is sent because the silence interval reached `pause_sec`, the script adds a trailing `.` to that chunk (if it does not already end with `.`, `!`, or `?`).
 
 If you want console output for debugging:
 - set `output_mode = "console"` in `main.py`.
 
-## 5. Recording state and auto-pause
+## 5. Push-to-talk recording
 
-- Startup state is `PAUSE` (recording is off until `F9`).
-- While in `RECORD`, if there is no successful transcription for `inactivity_pause_sec` seconds, the script automatically returns to `PAUSE`.
-- Default `inactivity_pause_sec` value is `120` seconds (2 minutes).
-- To resume after auto-pause, press `F9`.
+- The microphone audio is accumulated only while `F9` is physically held down.
+- No partial transcription is started while recording.
+- Releasing `F9` sends the whole accumulated recording to Whisper.
+- The complete recognized text always ends with punctuation: Whisper's `?` is
+  preserved for a question; otherwise the text ends with `.`.
 
 ## 6. Main config (main.py)
 
@@ -73,13 +72,6 @@ If you want console output for debugging:
 - Audio:
   - `sample_rate` (default `16000`)
   - `block_ms` (audio callback block size)
-- Chunking:
-  - `pause_sec` (silence duration to close chunk)
-  - `inactivity_pause_sec` (auto-pause timeout when no transcription is produced)
-  - `min_utterance_sec` (minimum accepted utterance)
-  - `min_emit_sec` (minimum chunk size before pause-based send)
-  - `max_utterance_sec` (forced split for very long speech)
-  - `max_split_overlap_sec` (overlap on forced split to reduce word loss)
 - Whisper:
   - `model_size` (`medium`, `large-v3`, etc.)
   - `language` (for Russian use `"ru"`)
@@ -90,8 +82,10 @@ If you want console output for debugging:
   - `vad_speech_pad_ms` (Silero VAD padding inside whisper)
   - `blacklist_phrases` (known hallucinations to remove)
 - Hotkeys:
-  - `hotkey_toggle = "f9"`
+  - `hotkey_record = "f9"`
   - `hotkey_quit = "f10"`
+  - `f9_release_debounce_sec = 0.25` (ignores short false release/press events
+    produced by some keyboards while F9 is still physically held)
 
 ## 7. Run on a PC without GPU (CPU mode)
 
@@ -129,9 +123,12 @@ Default GPU config:
 ```python
 device = "cuda"
 compute_type = "float16"
+cuda_gpu_name = "2080 Ti"
 ```
 
-If GPU is not used, verify your CUDA stack and `ctranslate2`/`faster-whisper` environment.
+At startup the script finds the GPU by name through `nvidia-smi`, sets it as the
+only visible CUDA device, and then loads Faster-Whisper. If RTX 2080 Ti cannot be
+found, startup stops instead of silently using RTX 4090 or another GPU.
 
 ## 10. Troubleshooting
 
@@ -144,16 +141,6 @@ If GPU is not used, verify your CUDA stack and `ctranslate2`/`faster-whisper` en
 - Keep microphone close and clean input signal.
 - For best accuracy, keep the active transcription language aligned with the spoken language (use voice commands above to switch).
 - Increase model size (`large-v3`) for better accuracy.
-- Tune chunking: larger `pause_sec` and `min_emit_sec` reduce fragmented chunks.
-
-### Words disappear at chunk boundaries
-- Increase `max_split_overlap_sec` (for example from `0.6` to `0.8`).
-- Increase `vad_speech_pad_ms` (for example to `320`).
-
-### Frequent very short chunks (1-3 sec)
-- Increase `min_emit_sec`.
-- Increase `pause_sec`.
-- Lower `silence_rms_threshold` if silence detector is too aggressive.
 
 ## 11. Privacy
 

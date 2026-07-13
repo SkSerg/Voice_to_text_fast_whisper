@@ -1,5 +1,7 @@
+import os
 import queue
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -8,7 +10,6 @@ from dataclasses import dataclass
 import keyboard as kb
 import numpy as np
 import sounddevice as sd
-from faster_whisper import WhisperModel
 from pynput.keyboard import Controller
 
 
@@ -17,16 +18,11 @@ class Config:
     sample_rate: int = 16000
     block_ms: int = 100
     pause_sec: float = 1.4
-    inactivity_pause_sec: float = 120.0
-    min_utterance_sec: float = 0.9
-    min_emit_sec: float = 3.5
-    max_utterance_sec: float = 20.0
-    max_split_overlap_sec: float = 0.6
-    silence_rms_threshold: float = 0.005
     model_size: str = "large-v3"  # "tiny", "base", "small", "medium", "large", "large-v2", "large-v3"
     device: str = "cuda"  # "cpu" or "cuda"
     compute_type: str = "float16"  # "int8", "int8_float16", "float16", "float32"
-    cuda_device: int = 0
+    cuda_device: int = 0  # index inside CUDA_VISIBLE_DEVICES
+    cuda_gpu_name: str = "2080 Ti"
     language: str = "ru"
     beam_size: int = 5
     best_of: int = 5
@@ -44,12 +40,12 @@ class Config:
         "Продолжение следует....",
     )
     output_mode: str = "active_window"  # "console" or "active_window"
-    hotkey_toggle: str = "f9"
+    hotkey_record: str = "f9"
     hotkey_quit: str = "f10"
+    f9_release_debounce_sec: float = 0.25
     replace_ellipsis: bool = True
-    strip_trailing_punctuation: bool = True
+    strip_trailing_punctuation: bool = False
     skip_if_buffer_rms_below: float = 0.0035
-    min_voiced_chunk_ratio: float = 0.12
     type_delay_sec: float = 0.01  # small delay between keypresses
     add_newline: bool = False
 
@@ -58,6 +54,8 @@ class Transcriber:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         if cfg.device == "cuda":
+            self._select_cuda_gpu(cfg.cuda_gpu_name)
+            cfg.cuda_device = 0
             try:
                 import ctranslate2 as ct
                 if hasattr(ct, "get_cuda_version"):
@@ -68,11 +66,57 @@ class Transcriber:
                     print(f"cuda devices: {ct.get_cuda_device_count()}", flush=True)
             except Exception as exc:
                 print(f"CUDA check failed: {exc}", file=sys.stderr)
+        # Import only after CUDA_VISIBLE_DEVICES has been set. CTranslate2 reads
+        # the variable while its CUDA runtime is initialized.
+        from faster_whisper import WhisperModel
+
         self.model = WhisperModel(
             cfg.model_size,
             device=cfg.device,
             compute_type=cfg.compute_type,
             device_index=cfg.cuda_device,
+        )
+
+    @staticmethod
+    def _select_cuda_gpu(required_name: str) -> None:
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,name",
+                    "--format=csv,noheader,nounits",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise RuntimeError(
+                "Не удалось определить GPU через nvidia-smi; запуск CUDA остановлен, "
+                "чтобы случайно не использовать другую видеокарту."
+            ) from exc
+
+        available: list[tuple[str, str]] = []
+        for line in result.stdout.splitlines():
+            index, separator, name = line.partition(",")
+            if separator:
+                available.append((index.strip(), name.strip()))
+
+        matches = [gpu for gpu in available if required_name.casefold() in gpu[1].casefold()]
+        if not matches:
+            detected = ", ".join(f"{index}: {name}" for index, name in available) or "нет"
+            raise RuntimeError(
+                f"GPU с именем '{required_name}' не найдена. Обнаружены: {detected}. "
+                "Запуск остановлен, чтобы не использовать RTX 4090 или другую карту."
+            )
+
+        physical_index, gpu_name = matches[0]
+        os.environ["CUDA_VISIBLE_DEVICES"] = physical_index
+        print(
+            f"Выбрана GPU {physical_index}: {gpu_name} "
+            f"(CUDA device_index внутри процесса: 0).",
+            flush=True,
         )
 
     def set_language(self, language: str) -> None:
@@ -140,28 +184,34 @@ class Transcriber:
         return text
 
 
+def ensure_final_punctuation(text: str) -> str:
+    """End the complete transcription with either '?' or '.'."""
+    text = text.rstrip()
+    is_question = text.endswith("?")
+    text = text.rstrip(".,!?;: ")
+    if not text:
+        return ""
+    return f"{text}{'?' if is_question else '.'}"
+
+
 def main() -> int:
     cfg = Config()
     keyboard = Controller()
-    running = threading.Event()
-    running.clear()
+    recording = threading.Event()
     stop_requested = threading.Event()
-    flush_requested = threading.Event()
-    last_transcription_time = time.monotonic()
 
     block_samples = int(cfg.sample_rate * cfg.block_ms / 1000)
-    block_bytes = block_samples * 2  # int16
-
-    q: queue.Queue[bytes] = queue.Queue(maxsize=200)
     work_q: queue.Queue[tuple[bytes, bool] | None] = queue.Queue(maxsize=10)
+    capture_buffer = bytearray()
+    capture_lock = threading.Lock()
+    release_generation = 0
 
     def audio_callback(indata, _frames, _time, status):
         if status:
             print(status, file=sys.stderr)
-        try:
-            q.put_nowait(bytes(indata))
-        except queue.Full:
-            pass
+        with capture_lock:
+            if recording.is_set():
+                capture_buffer.extend(bytes(indata))
 
     stream = sd.InputStream(
         samplerate=cfg.sample_rate,
@@ -172,16 +222,10 @@ def main() -> int:
     )
 
     print(
-        f"Состояние: ПАУЗА. Для запуска нажмите F9. Для выхода нажмите F10. "
-        f"Автопауза: {int(cfg.inactivity_pause_sec)} сек без транскрибации.",
+        "Готово. Удерживайте F9 для записи; после отпускания начнётся "
+        "распознавание. Для выхода нажмите F10.",
         flush=True,
     )
-
-    min_utt_bytes = int(cfg.min_utterance_sec * cfg.sample_rate) * 2
-    min_emit_bytes = int(cfg.min_emit_sec * cfg.sample_rate) * 2
-    max_utt_bytes = int(cfg.max_utterance_sec * cfg.sample_rate) * 2
-    max_overlap_bytes = int(cfg.max_split_overlap_sec * cfg.sample_rate) * 2
-    silence_chunks_needed = max(1, int(cfg.pause_sec * 1000 / cfg.block_ms))
 
     transcriber = Transcriber(cfg)
     language_commands = {
@@ -214,7 +258,6 @@ def main() -> int:
                 continue
 
     def worker():
-        nonlocal last_transcription_time
         while True:
             item = work_q.get()
             if item is None:
@@ -227,11 +270,9 @@ def main() -> int:
                 continue
             text = transcriber.transcribe(pcm)
             if text:
-                last_transcription_time = time.monotonic()
-                if add_sentence_dot and text[-1] not in ".!?":
-                    text = f"{text}."
                 if try_switch_language(text):
                     continue
+                text = ensure_final_punctuation(text)
                 if cfg.output_mode == "active_window":
                     keyboard.type(text + " ")
                     if cfg.add_newline:
@@ -245,103 +286,74 @@ def main() -> int:
     worker_thread = threading.Thread(target=worker, daemon=True)
     worker_thread.start()
 
-    def on_toggle():
-        nonlocal last_transcription_time
-        if running.is_set():
-            running.clear()
-            flush_requested.set()
-            print("\nСостояние: ПАУЗА. Для запуска нажмите F9.", flush=True)
-        else:
-            running.set()
-            last_transcription_time = time.monotonic()
-            print(
-                f"\nСостояние: ЗАПИСЬ. Автопауза через {int(cfg.inactivity_pause_sec)} сек без транскрибации.",
-                flush=True,
-            )
+    def on_record_press(_event) -> None:
+        nonlocal release_generation
+        if stop_requested.is_set():
+            return
+        with capture_lock:
+            # Some keyboards/drivers emit a short release/press pair while F9
+            # is physically held. Invalidate a pending delayed release without
+            # clearing the audio already collected.
+            release_generation += 1
+            if recording.is_set():
+                return
+            capture_buffer.clear()
+            recording.set()
+        print("\nСостояние: ЗАПИСЬ (F9 удерживается).", flush=True)
+
+    def finish_recording(expected_generation: int | None = None) -> None:
+        with capture_lock:
+            if expected_generation is not None and expected_generation != release_generation:
+                return
+            if not recording.is_set():
+                return
+            recording.clear()
+            payload = bytes(capture_buffer)
+            capture_buffer.clear()
+        if payload:
+            print("\nСостояние: ОБРАБОТКА. Запись завершена.", flush=True)
+            enqueue_audio(payload)
+
+    def on_record_release(_event) -> None:
+        nonlocal release_generation
+        with capture_lock:
+            if not recording.is_set():
+                return
+            release_generation += 1
+            expected_generation = release_generation
+
+        # Confirm that F9 really stayed released. A repeated press invalidates
+        # this generation and recording continues in the same buffer.
+        release_timer = threading.Timer(
+            cfg.f9_release_debounce_sec,
+            finish_recording,
+            args=(expected_generation,),
+        )
+        release_timer.daemon = True
+        release_timer.start()
 
     def on_quit():
+        nonlocal release_generation
+        with capture_lock:
+            release_generation += 1
+        finish_recording()
         stop_requested.set()
-        flush_requested.set()
-        running.set()
         try:
             work_q.put_nowait(None)
         except queue.Full:
             pass
 
-    kb.add_hotkey(cfg.hotkey_toggle, on_toggle)
-    kb.add_hotkey(cfg.hotkey_quit, on_quit)
+    kb.on_press_key(cfg.hotkey_record, on_record_press, suppress=True)
+    kb.on_release_key(cfg.hotkey_record, on_record_release, suppress=True)
+    kb.add_hotkey(cfg.hotkey_quit, on_quit, suppress=True)
 
     with stream:
         try:
-            capture_buffer = bytearray()
-            silence_chunks = 0
             while not stop_requested.is_set():
-                if running.is_set() and (time.monotonic() - last_transcription_time >= cfg.inactivity_pause_sec):
-                    running.clear()
-                    capture_buffer.clear()
-                    silence_chunks = 0
-                    print(
-                        f"\nСостояние: ПАУЗА. Нет транскрибации {int(cfg.inactivity_pause_sec)} сек. Для запуска нажмите F9.",
-                        flush=True,
-                    )
-
-                if flush_requested.is_set():
-                    if len(capture_buffer) >= min_utt_bytes:
-                        enqueue_audio(bytes(capture_buffer))
-                    capture_buffer.clear()
-                    silence_chunks = 0
-                    flush_requested.clear()
-
-                if not running.is_set():
-                    # Drop mic data while paused to avoid stale transcription.
-                    while True:
-                        try:
-                            q.get_nowait()
-                        except queue.Empty:
-                            break
-                    time.sleep(0.05)
-                    continue
-                try:
-                    chunk = q.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-                if len(chunk) < block_bytes:
-                    continue
-                capture_buffer.extend(chunk)
-
-                chunk_pcm = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
-                chunk_rms = float(np.sqrt(np.mean(chunk_pcm * chunk_pcm)))
-                if chunk_rms < cfg.silence_rms_threshold:
-                    silence_chunks += 1
-                else:
-                    silence_chunks = 0
-
-                if (
-                    len(capture_buffer) >= min_utt_bytes
-                    and len(capture_buffer) >= min_emit_bytes
-                    and silence_chunks >= silence_chunks_needed
-                ):
-                    chunks_total = len(capture_buffer) // block_bytes
-                    voiced_chunks = max(0, chunks_total - silence_chunks)
-                    voiced_ratio = (voiced_chunks / chunks_total) if chunks_total > 0 else 0.0
-                    if voiced_ratio < cfg.min_voiced_chunk_ratio:
-                        capture_buffer.clear()
-                        silence_chunks = 0
-                        continue
-                    enqueue_audio(bytes(capture_buffer), add_sentence_dot=True)
-                    capture_buffer.clear()
-                    silence_chunks = 0
-
-                if len(capture_buffer) >= max_utt_bytes:
-                    enqueue_audio(bytes(capture_buffer))
-                    if max_overlap_bytes > 0 and len(capture_buffer) > max_overlap_bytes:
-                        capture_buffer = bytearray(capture_buffer[-max_overlap_bytes:])
-                    else:
-                        capture_buffer.clear()
-                    silence_chunks = 0
+                stop_requested.wait(0.1)
         except KeyboardInterrupt:
             print("\nStopped.")
-            flush_requested.set()
+            finish_recording()
             try:
                 work_q.put_nowait(None)
             except queue.Full:
